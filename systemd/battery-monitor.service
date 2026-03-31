@@ -1,0 +1,21 @@
+[Unit]
+Description=Battery Monitor Daemon
+Documentation=https://github.com/santificex/battery-monitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/battery-monitor/src/daemon/battery_daemon.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits — keep daemon impact minimal
+CPUQuota=5%
+MemoryMax=128M
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

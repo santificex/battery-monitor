@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""
+bmon — Battery Monitor CLI
+==========================
+Quick command-line inspection of power data without opening the UI.
+
+Usage:
+  bmon              Show current top consumers
+  bmon top [N]      Show top N processes (default 10)
+  bmon kill <PID>   Terminate a process by PID
+  bmon history      Show battery discharge over last 30 minutes
+  bmon status       Show current battery status
+  bmon export FILE  Export history to CSV
+"""
+
+import sys
+import os
+import signal
+import argparse
+import time
+from pathlib import Path
+from datetime import datetime, timedelta
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.shared.config import config
+from src.daemon.database import DatabaseManager
+from src.daemon.process_classifier import safety_label
+from src.ui.process_killer import ProcessKiller
+
+# ── ANSI colours ──────────────────────────────────────────────────────────────
+
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+GREEN  = "\033[92m"
+BLUE   = "\033[94m"
+CYAN   = "\033[96m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+RESET  = "\033[0m"
+
+SAFETY_COLOR = {
+    "safe":    GREEN,
+    "caution": YELLOW,
+    "unsafe":  RED,
+}
+
+
+def _col(level: str, text: str) -> str:
+    return SAFETY_COLOR.get(level, "") + text + RESET
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_status(db: DatabaseManager) -> None:
+    snap = db.get_latest_snapshot()
+    if snap is None:
+        print(f"{YELLOW}No data — is the daemon running?{RESET}")
+        print("  Start it: systemctl --user start battery-monitor")
+        return
+
+    age = time.time() - snap["timestamp"]
+    pct    = snap["battery_percent"]
+    status = snap["battery_status"] or "Unknown"
+    rate   = snap["discharge_rate_watts"]
+    mins   = snap["time_remaining_min"]
+
+    icon = "🔋"
+    if status.lower() == "charging":
+        icon = "🔌"
+    elif pct and pct < 20:
+        icon = "🪫"
+
+    print(f"\n{BOLD}Battery Status{RESET}")
+    print(f"  {icon}  {BOLD}{pct:.0f}%{RESET}  ·  {status}")
+    if rate is not None:
+        print(f"  Discharge rate: {BOLD}{rate:.2f}W{RESET}")
+    if mins is not None:
+        h, m = divmod(int(mins), 60)
+        remain = f"{h}h {m:02d}m" if h else f"{m}m"
+        print(f"  Time remaining: ~{remain}")
+    print(f"  {DIM}Data age: {age:.0f}s ago{RESET}\n")
+
+
+def cmd_top(db: DatabaseManager, n: int = 10) -> None:
+    procs = db.get_latest_processes(limit=n)
+    if not procs:
+        print(f"{YELLOW}No process data yet.{RESET}")
+        return
+
+    comps = db.get_latest_components()
+
+    print(f"\n{BOLD}Top Power Consumers{RESET}")
+    print(f"  {'PROCESS':<22} {'PID':>6}  {'WATTS':>6}  {'CPU':>5}  {'MEM':>7}  SAFETY")
+    print("  " + "─" * 62)
+
+    for proc in procs:
+        safety = proc["kill_safety"] or "caution"
+        color  = SAFETY_COLOR.get(safety, "")
+        name   = proc["name"][:22]
+        label  = safety_label(safety)[:9]
+        print(
+            f"  {color}{name:<22}{RESET}"
+            f"  {proc['pid']:>6}"
+            f"  {proc['estimated_watts']:>5.2f}W"
+            f"  {proc['cpu_percent']:>4.1f}%"
+            f"  {proc['memory_mb']:>6.0f}MB"
+            f"  {color}{label}{RESET}"
+        )
+
+    if comps:
+        print(f"\n{BOLD}Hardware Components{RESET}")
+        for c in comps:
+            print(f"  {c['component']:<30} {c['estimated_watts']:.2f}W")
+    print()
+
+
+def cmd_history(db: DatabaseManager) -> None:
+    rows = db.get_recent_snapshots(minutes=30)
+    if not rows:
+        print(f"{YELLOW}No history available.{RESET}")
+        return
+
+    print(f"\n{BOLD}Battery Discharge History (last 30 min){RESET}")
+    print(f"  {'TIME':<8}  {'BATTERY':>8}  {'RATE':>8}  STATUS")
+    print("  " + "─" * 42)
+    for row in rows:
+        ts   = datetime.fromtimestamp(row["timestamp"]).strftime("%H:%M:%S")
+        pct  = f"{row['battery_percent']:.0f}%" if row["battery_percent"] else "  ?%"
+        rate = f"{row['discharge_rate_watts']:.2f}W" if row["discharge_rate_watts"] else "   ?W"
+        stat = row["battery_status"] or "?"
+        print(f"  {ts:<8}  {pct:>8}  {rate:>8}  {stat}")
+    print()
+
+
+def cmd_kill(db: DatabaseManager, pid: int) -> None:
+    procs = db.get_latest_processes(limit=100)
+    target = next((dict(p) for p in procs if p["pid"] == pid), None)
+
+    if target is None:
+        print(f"{YELLOW}PID {pid} not found in recent data. Attempting kill anyway…{RESET}")
+        import psutil
+        try:
+            p = psutil.Process(pid)
+            target = {
+                "pid":         pid,
+                "name":        p.name(),
+                "kill_safety": "caution",
+            }
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+            print(f"{RED}Cannot access PID {pid}: {exc}{RESET}")
+            sys.exit(1)
+
+    safety = target.get("kill_safety", "caution")
+    if safety == "unsafe":
+        print(f"{RED}✗ {target['name']} is a protected process — cannot kill.{RESET}")
+        sys.exit(1)
+
+    confirm = input(
+        f"Kill {target['name']} (PID {pid})  [{safety_label(safety)}]? [y/N] "
+    ).strip().lower()
+    if confirm != "y":
+        print("Aborted.")
+        return
+
+    killer = ProcessKiller(db)
+    result = killer.kill(
+        pid=pid,
+        name=target["name"],
+        kill_safety=safety,
+        force=False,
+    )
+    if result.success:
+        print(f"{GREEN}✓ {result.message}{RESET}")
+    else:
+        print(f"{RED}✗ {result.message}{RESET}")
+        sys.exit(1)
+
+
+def cmd_export(db: DatabaseManager, filepath: str) -> None:
+    count = db.export_csv(filepath)
+    if count:
+        print(f"{GREEN}✓ Exported {count} snapshots to {filepath}{RESET}")
+    else:
+        print(f"{YELLOW}No data to export.{RESET}")
+
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="bmon",
+        description="Battery Monitor CLI — quick power inspection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("status",  help="Current battery status")
+
+    p_top = sub.add_parser("top", help="Top N power consumers")
+    p_top.add_argument("n", nargs="?", type=int, default=10,
+                       metavar="N", help="Number of processes (default 10)")
+
+    sub.add_parser("history", help="Battery discharge history (30 min)")
+
+    p_kill = sub.add_parser("kill", help="Kill a process by PID")
+    p_kill.add_argument("pid", type=int, metavar="PID")
+
+    p_exp = sub.add_parser("export", help="Export history to CSV")
+    p_exp.add_argument("file", metavar="FILE")
+
+    args = parser.parse_args()
+    db   = DatabaseManager()
+
+    if args.cmd is None or args.cmd == "top":
+        cmd_status(db)
+        cmd_top(db, getattr(args, "n", 10))
+    elif args.cmd == "status":
+        cmd_status(db)
+    elif args.cmd == "history":
+        cmd_history(db)
+    elif args.cmd == "kill":
+        cmd_kill(db, args.pid)
+    elif args.cmd == "export":
+        cmd_export(db, args.file)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
