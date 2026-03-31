@@ -43,17 +43,47 @@ logging.basicConfig(level=logging.WARNING)
 FONT             = "Monospace 9"
 PADDING          = 12
 BG_R, BG_G, BG_B = 0.08, 0.08, 0.12   # dark navy background
-BG_ALPHA         = 0.82                 # 82% opaque — adjust to taste
+BG_ALPHA         = 0.18                 # nearly transparent — adjust to taste
 FG_R, FG_G, FG_B = 0.90, 0.90, 0.92   # near-white text
 CORNER_RADIUS    = 8
+
+
+# ── Display name helper ───────────────────────────────────────────────────────
+
+def _display_name(proc: dict) -> str:
+    """
+    Return a human-friendly name for the process.
+    For python3/python interpreters, dig into the cmdline to show
+    what script or module is actually running instead of just 'python3'.
+    """
+    name = (proc.get("name") or "").lower()
+    if name in ("python3", "python", "python2", "python3.10", "python3.11", "python3.12"):
+        cmdline = proc.get("cmdline") or ""
+        parts   = cmdline.split()
+        i = 1  # skip parts[0] which is the python executable itself
+        while i < len(parts):
+            part = parts[i]
+            if part in ("-m",):
+                # e.g. python3 -m http.server  → show "http.server"
+                if i + 1 < len(parts):
+                    module = parts[i + 1].split(".")[-1]  # last component only
+                    return f"py:{module[:14]}"
+            elif part in ("-c",):
+                return "py:(inline)"
+            elif not part.startswith("-"):
+                # First positional argument is the script path
+                script = Path(part).stem  # filename without extension
+                return f"py:{script[:14]}"
+            i += 1
+        return "python3"
+    return (proc.get("name") or "")[:16]
 
 
 # ── Text builder ──────────────────────────────────────────────────────────────
 
 def _build_text(db: DatabaseManager) -> str:
     """Pull the latest snapshot from the DB and format it as plain text."""
-    snap  = db.get_latest_snapshot()
-    procs = db.get_latest_processes(limit=config.show_top_n_in_widget)
+    snap = db.get_latest_snapshot()
 
     lines = []
 
@@ -84,21 +114,25 @@ def _build_text(db: DatabaseManager) -> str:
         lines.append(f"{arrow} {rate_str}")
 
     # ── Process list ──────────────────────────────────────────────────────────
+    # Fetch extra rows so filtering protected still leaves enough to display
+    all_procs = db.get_latest_processes(limit=config.show_top_n_in_widget * 4)
+    visible   = [dict(p) for p in all_procs if p["kill_safety"] != "unsafe"]
+    visible   = visible[:config.show_top_n_in_widget]
+
     lines.append("")
     lines.append("Top consumers")
-    lines.append("-" * 34)
+    lines.append("-" * 37)
 
-    if procs:
-        for i, proc in enumerate(procs, 1):
-            name   = proc["name"][:18]
-            watts  = proc["estimated_watts"] or 0.0
-            safety = proc["kill_safety"] or "caution"
-            label  = safety_label(safety)[:9]
-            lines.append(f" {i}.  {name:<18}  {watts:>5.2f}W  {label}")
+    if visible:
+        for i, proc in enumerate(visible, 1):
+            name  = _display_name(proc)
+            watts = proc["estimated_watts"] or 0.0
+            cpu   = proc["cpu_percent"] or 0.0
+            lines.append(f" {i}.  {name:<16}  {cpu:>4.1f}%  {watts:>4.2f}W")
     else:
         lines.append("  (no process data yet)")
 
-    lines.append("-" * 34)
+    lines.append("-" * 37)
     lines.append(f"  {datetime.now().strftime('%H:%M:%S')}")
 
     return "\n".join(lines)
