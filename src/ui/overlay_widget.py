@@ -125,10 +125,10 @@ def _build_text(db: DatabaseManager) -> str:
 
     if visible:
         for i, proc in enumerate(visible, 1):
-            name  = _display_name(proc)
-            watts = proc["estimated_watts"] or 0.0
-            cpu   = proc["cpu_percent"] or 0.0
-            lines.append(f" {i}.  {name:<16}  {cpu:>4.1f}%  {watts:>4.2f}W")
+            name      = _display_name(proc)
+            watts     = proc["estimated_watts"] or 0.0
+            pwr_pct   = (watts / rate * 100) if (rate and rate > 0) else 0.0
+            lines.append(f" {i}.  {name:<16}  {pwr_pct:>4.1f}%  {watts:>4.2f}W")
     else:
         lines.append("  (no process data yet)")
 
@@ -158,10 +158,10 @@ class OverlayWindow(Gtk.Window):
 
         # ── Window behaviour ──────────────────────────────────────────────────
         self.set_decorated(False)           # no title bar
-        self.set_keep_above(True)           # float above everything
+        self.set_keep_below(True)           # stay behind normal windows (desktop widget)
         self.set_skip_taskbar_hint(True)    # hide from taskbar
         self.set_skip_pager_hint(True)      # hide from alt-tab
-        self.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
         self.set_resizable(False)
 
         # ── Text label ────────────────────────────────────────────────────────
